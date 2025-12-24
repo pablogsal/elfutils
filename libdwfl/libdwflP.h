@@ -674,6 +674,8 @@ int
 __libdwfl_debuginfod_find_debuginfo (Dwfl *dwfl,
 				     const unsigned char *build_id_bits,
 				     size_t build_id_len);
+int
+__libdwfl_debuginfod_find_dwo (Dwfl *dwfl, uint64_t dwo_id);
 void
 __libdwfl_debuginfod_end (debuginfod_client *c);
 #endif

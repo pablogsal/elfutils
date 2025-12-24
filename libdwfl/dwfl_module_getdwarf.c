@@ -40,6 +40,16 @@
 #include "libelfP.h"
 #include "system.h"
 
+#ifdef ENABLE_LIBDEBUGINFOD
+/* Callback for libdw to find DWO/DWP files via debuginfod.  */
+static int
+dwfl_dwo_lookup_callback (uint64_t dwo_id, void *user_data)
+{
+  Dwfl *dwfl = (Dwfl *) user_data;
+  return __libdwfl_debuginfod_find_dwo (dwfl, dwo_id);
+}
+#endif
+
 static inline Dwfl_Error
 open_elf_file (Elf **elf, int *fd, char **name)
 {
@@ -1398,6 +1408,12 @@ load_dw (Dwfl_Module *mod, struct dwfl_file *debugfile)
       mod->dw->elfpath = strdup (mod->elfpath);
       __libdw_set_debugdir (mod->dw);
     }
+
+#ifdef ENABLE_LIBDEBUGINFOD
+  /* Set up the DWO lookup callback so that debuginfod can find split
+     DWARF files when they are not available locally.  */
+  dwarf_set_dwo_lookup (mod->dw, dwfl_dwo_lookup_callback, mod->dwfl);
+#endif
 
   /* Until we have iterated through all CU's, we might do lazy lookups.  */
   mod->lazycu = 1;

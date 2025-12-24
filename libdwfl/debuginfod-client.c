@@ -43,6 +43,7 @@
 static __typeof__ (debuginfod_begin) *fp_debuginfod_begin;
 static __typeof__ (debuginfod_find_executable) *fp_debuginfod_find_executable;
 static __typeof__ (debuginfod_find_debuginfo) *fp_debuginfod_find_debuginfo;
+static __typeof__ (debuginfod_find_dwo_by_id) *fp_debuginfod_find_dwo_by_id;
 static __typeof__ (debuginfod_end) *fp_debuginfod_end;
 
 static void __libdwfl_debuginfod_init (void);
@@ -103,6 +104,19 @@ __libdwfl_debuginfod_find_debuginfo (Dwfl *dwfl,
   return fd;
 }
 
+int
+__libdwfl_debuginfod_find_dwo (Dwfl *dwfl, uint64_t dwo_id)
+{
+  int fd = -1;
+  /* Get the client first - this triggers __libdwfl_debuginfod_init
+     which loads the debuginfod library and sets up function pointers.  */
+  debuginfod_client *c = INTUSE (dwfl_get_debuginfod_client) (dwfl);
+  if (c != NULL && fp_debuginfod_find_dwo_by_id != NULL)
+    fd = (*fp_debuginfod_find_dwo_by_id) (c, dwo_id, NULL);
+
+  return fd;
+}
+
 void
 __libdwfl_debuginfod_end (debuginfod_client *c)
 {
@@ -124,9 +138,12 @@ __libdwfl_debuginfod_init (void)
 					     "debuginfod_find_executable");
       fp_debuginfod_find_debuginfo = dlsym (debuginfod_so,
 					    "debuginfod_find_debuginfo");
+      fp_debuginfod_find_dwo_by_id = dlsym (debuginfod_so,
+					    "debuginfod_find_dwo_by_id");
       fp_debuginfod_end = dlsym (debuginfod_so, "debuginfod_end");
 
-      /* We either get them all, or we get none.  */
+      /* We either get them all, or we get none.
+         Note: debuginfod_find_dwo_by_id is optional.  */
       if (fp_debuginfod_begin == NULL
 	  || fp_debuginfod_find_executable == NULL
 	  || fp_debuginfod_find_debuginfo == NULL
@@ -135,6 +152,7 @@ __libdwfl_debuginfod_init (void)
 	  fp_debuginfod_begin = NULL;
 	  fp_debuginfod_find_executable = NULL;
 	  fp_debuginfod_find_debuginfo = NULL;
+	  fp_debuginfod_find_dwo_by_id = NULL;
 	  fp_debuginfod_end = NULL;
 	  dlclose (debuginfod_so);
 	}
