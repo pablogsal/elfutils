@@ -264,7 +264,7 @@ export ELFUTILS_MEMORY_SANITIZER = 1
 endif
 
 if DEBUGINFOD
-check_PROGRAMS += debuginfod_build_id_find
+check_PROGRAMS += debuginfod_build_id_find debuginfod_dwoid_find
 # With the dummy delegation doesn't work
 if !DUMMY_LIBDEBUGINFOD
 TESTS += run-srcfiles-self.sh \
@@ -297,7 +297,8 @@ TESTS += run-srcfiles-self.sh \
 	 run-debuginfod-client-profile.sh \
 	 run-debuginfod-find-metadata.sh \
 	 run-debuginfod-longsource.sh \
-	 run-debuginfod-homesite.sh
+	 run-debuginfod-homesite.sh \
+	 run-debuginfod-dwoid.sh
 if LZMA
 TESTS += run-debuginfod-seekable.sh
 endif
@@ -638,6 +639,7 @@ EXTRA_DIST = run-arextract.sh run-arsymtest.sh run-ar.sh \
 	     run-debuginfod-find-metadata.sh \
 	     run-debuginfod-longsource.sh \
 	     run-debuginfod-homesite.sh \
+	     run-debuginfod-dwoid.sh \
 	     debuginfod-rpms/fedora30/hello2-1.0-2.src.rpm \
 	     debuginfod-rpms/fedora30/hello2-1.0-2.x86_64.rpm \
 	     debuginfod-rpms/fedora30/hello2-debuginfo-1.0-2.x86_64.rpm \
@@ -893,6 +895,7 @@ next_cfi_LDADD = $(libeu) $(libelf) $(libdw)
 elfcopy_LDADD = $(libelf)
 addsections_LDADD = $(libelf)
 debuginfod_build_id_find_LDADD = $(libelf) $(libdw)
+debuginfod_dwoid_find_LDADD = $(libelf) $(libdw)
 xlate_notes_LDADD = $(libelf)
 elfrdwrnop_LDADD = $(libelf)
 dwelf_elf_e_machine_string_LDADD = $(libelf) $(libdw)

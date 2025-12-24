@@ -144,7 +144,7 @@ PID1=0
 if type sqlite3 2>/dev/null; then
 	# Emulate the case of upgrading from an old server without the seekable
 	# optimization by dropping the _r_seekable table.
-	sqlite3 "$DB" 'DROP TABLE buildids10_r_seekable'
+	sqlite3 "$DB" 'DROP TABLE buildids11_r_seekable'
 
 	env LD_LIBRARY_PATH=$ldpath ${abs_builddir}/../debuginfod/debuginfod $VERBOSE \
 		-d $DB -p $PORT2 -t0 -g0 \
