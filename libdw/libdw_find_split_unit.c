@@ -41,48 +41,54 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+/* Try to find the split unit in the file opened as split_fd.
+   Takes ownership of split_fd and will close it.  */
+static void
+try_split_fd (Dwarf_CU *cu, int split_fd)
+{
+  Dwarf *split_dwarf = dwarf_begin (split_fd, DWARF_C_READ);
+  if (split_dwarf != NULL)
+    {
+      Dwarf_CU *split = NULL;
+      while (INTUSE(dwarf_get_units) (split_dwarf, split, &split,
+				      NULL, NULL, NULL, NULL) == 0)
+	{
+	  if (split->unit_type == DW_UT_split_compile
+	      && cu->unit_id8 == split->unit_id8)
+	    {
+	      if (eu_tsearch (split->dbg, &cu->dbg->split_tree,
+			      __libdw_finddbg_cb) == NULL)
+		{
+		  /* Something went wrong.  Don't link.  */
+		  __libdw_seterrno (DWARF_E_NOMEM);
+		  break;
+		}
+
+	      /* Link skeleton and split compile units.  */
+	      __libdw_link_skel_split (cu, split);
+
+	      /* We have everything we need from this ELF
+		 file.  And we are going to close the fd to
+		 not run out of file descriptors.  */
+	      elf_cntl (split_dwarf->elf, ELF_C_FDDONE);
+	      break;
+	    }
+	}
+      if (cu->split == (Dwarf_CU *) -1)
+	dwarf_end (split_dwarf);
+    }
+  /* Always close, because we don't want to run out of file
+     descriptors.  See also the elf_fcntl ELF_C_FDDONE call
+     above.  */
+  close (split_fd);
+}
+
 static void
 try_split_file (Dwarf_CU *cu, const char *dwo_path)
 {
   int split_fd = open (dwo_path, O_RDONLY);
   if (split_fd != -1)
-    {
-      Dwarf *split_dwarf = dwarf_begin (split_fd, DWARF_C_READ);
-      if (split_dwarf != NULL)
-	{
-	  Dwarf_CU *split = NULL;
-	  while (INTUSE(dwarf_get_units) (split_dwarf, split, &split,
-					  NULL, NULL, NULL, NULL) == 0)
-	    {
-	      if (split->unit_type == DW_UT_split_compile
-		  && cu->unit_id8 == split->unit_id8)
-		{
-		  if (eu_tsearch (split->dbg, &cu->dbg->split_tree,
-				  __libdw_finddbg_cb) == NULL)
-		    {
-		      /* Something went wrong.  Don't link.  */
-		      __libdw_seterrno (DWARF_E_NOMEM);
-		      break;
-		    }
-
-		  /* Link skeleton and split compile units.  */
-		  __libdw_link_skel_split (cu, split);
-
-		  /* We have everything we need from this ELF
-		     file.  And we are going to close the fd to
-		     not run out of file descriptors.  */
-		  elf_cntl (split_dwarf->elf, ELF_C_FDDONE);
-		  break;
-		}
-	    }
-	  if (cu->split == (Dwarf_CU *) -1)
-	    dwarf_end (split_dwarf);
-	}
-      /* Always close, because we don't want to run out of file
-	 descriptors.  See also the elf_fcntl ELF_C_FDDONE call
-	 above.  */
-      close (split_fd);
-    }
+    try_split_fd (cu, split_fd);
 }
 
 static void
@@ -119,7 +125,11 @@ try_dwp_file (Dwarf_CU *cu)
 		  cu->dbg->dwp_fd = dwp_fd;
 		}
 	      else
-		close (dwp_fd);
+		{
+		  if (dwp_dwarf != NULL)
+		    dwarf_end (dwp_dwarf);
+		  close (dwp_fd);
+		}
 	    }
 	}
       if (cu->dbg->dwp_dwarf == NULL)
@@ -209,6 +219,23 @@ __libdw_find_split_unit (Dwarf_CU *cu)
 	  /* XXX If still not found we could try stripping dirs from the
 	     comp_dir and adding them from the comp_dir, assuming
 	     someone moved a whole build tree around.  */
+	}
+
+      /* If still not found, try the DWO lookup callback.  */
+      if (cu->split == (Dwarf_CU *) -1)
+	{
+	  /* Read callback pointer and user_data atomically.  */
+	  mutex_lock (cu->dbg->dwarf_lock);
+	  int (*cb) (uint64_t, void *) = cu->dbg->dwo_lookup_cb;
+	  void *user_data = cu->dbg->dwo_lookup_user_data;
+	  mutex_unlock (cu->dbg->dwarf_lock);
+
+	  if (cb != NULL)
+	    {
+	      int fd = cb (cu->unit_id8, user_data);
+	      if (fd >= 0)
+		try_split_fd (cu, fd);
+	    }
 	}
     }
 
