@@ -69,6 +69,7 @@ extern "C" {
 
 #include <unistd.h>
 #include <stdlib.h>
+#include <inttypes.h>
 #include <locale.h>
 #include <pthread.h>
 #include <signal.h>
@@ -167,7 +168,7 @@ string_endswith(const string& haystack, const string& needle)
 
 
 // Roll this identifier for every sqlite schema incompatibility.
-#define BUILDIDS "buildids10"
+#define BUILDIDS "buildids11"
 
 #if SQLITE_VERSION_NUMBER >= 3008000
 #define WITHOUT_ROWID "without rowid"
@@ -281,6 +282,37 @@ static const char DEBUGINFOD_SQLITE_DDL[] =
   "        foreign key (content) references " BUILDIDS "_files(id) on update cascade on delete cascade,\n"
   "        primary key (file, content)\n"
   "        ) " WITHOUT_ROWID ";\n"
+  // DWO ID interning table (analogous to _buildids)
+  "create table if not exists " BUILDIDS "_dwoids (\n"
+  "        id integer primary key not null,\n"
+  "        hex text unique not null);\n"  // 16 hex characters (64-bit dwo_id)
+  // File-based DWO content (analogous to _f_de)
+  "create table if not exists " BUILDIDS "_f_dwo (\n"
+  "        dwoid integer not null,\n"
+  "        file integer not null,\n"
+  "        mtime integer not null,\n"
+  "        is_dwp integer not null,\n"  // 1 if .dwp, 0 if .dwo or .o
+  "        foreign key (file) references " BUILDIDS "_files(id) on update cascade on delete cascade,\n"
+  "        foreign key (dwoid) references " BUILDIDS "_dwoids(id) on update cascade on delete cascade,\n"
+  "        primary key (dwoid, file, mtime)\n"
+  "        ) " WITHOUT_ROWID ";\n"
+  "create index if not exists " BUILDIDS "_f_dwo_idx on " BUILDIDS "_f_dwo (file, mtime);\n"
+  "create index if not exists " BUILDIDS "_f_dwo_dwoid_idx on " BUILDIDS "_f_dwo (dwoid);\n"
+  // Archive-based DWO content (analogous to _r_de)
+  "create table if not exists " BUILDIDS "_r_dwo (\n"
+  "        dwoid integer not null,\n"
+  "        file integer not null,\n"
+  "        mtime integer not null,\n"
+  "        content integer not null,\n"
+  "        is_dwp integer not null,\n"
+  "        foreign key (file) references " BUILDIDS "_files(id) on update cascade on delete cascade,\n"
+  "        foreign key (content) references " BUILDIDS "_files(id) on update cascade on delete cascade,\n"
+  "        foreign key (dwoid) references " BUILDIDS "_dwoids(id) on update cascade on delete cascade,\n"
+  "        primary key (dwoid, file, content, mtime)\n"
+  "        ) " WITHOUT_ROWID ";\n"
+  "create index if not exists " BUILDIDS "_r_dwo_idx on " BUILDIDS "_r_dwo (file, mtime);\n"
+  "create index if not exists " BUILDIDS "_r_dwo_idx2 on " BUILDIDS "_r_dwo (content);\n"
+  "create index if not exists " BUILDIDS "_r_dwo_dwoid_idx on " BUILDIDS "_r_dwo (dwoid);\n"
   // create views to glue together some of the above tables, for webapi D queries
   // NB: _query_d2 and _query_e2 were added to replace _query_d and _query_e
   // without updating BUILDIDS.  They can be renamed back the next time BUILDIDS
@@ -319,17 +351,31 @@ static const char DEBUGINFOD_SQLITE_DDL[] =
   "        where b.id = sr.buildid and f0.id = sd.file and fsref.id = sde.file and f1.id = sd.content\n"
   "        and sr.artifactsrc = sd.content and sde.buildid = sr.buildid\n"
   ";"
+  // ... and for DWO queries (split DWARF)
+  "create view if not exists " BUILDIDS "_query_dwo as \n"
+  "select\n"
+  "        d.hex as dwoid, 'F' as sourcetype, n.file as id0, f0.name as source0, n.mtime as mtime, null as id1, null as source1, n.is_dwp as is_dwp\n"
+  "        from " BUILDIDS "_dwoids d, " BUILDIDS "_files_v f0, " BUILDIDS "_f_dwo n\n"
+  "        where d.id = n.dwoid and f0.id = n.file\n"
+  "union all select\n"
+  "        d.hex as dwoid, 'R' as sourcetype, n.file as id0, f0.name as source0, n.mtime as mtime, n.content as id1, f1.name as source1, n.is_dwp as is_dwp\n"
+  "        from " BUILDIDS "_dwoids d, " BUILDIDS "_files_v f0, " BUILDIDS "_files_v f1, " BUILDIDS "_r_dwo n\n"
+  "        where d.id = n.dwoid and f0.id = n.file and f1.id = n.content\n"
+  ";"
   // and for startup overview counts
   "drop view if exists " BUILDIDS "_stats;\n"
   "create view if not exists " BUILDIDS "_stats as\n"
   "          select 'file d/e' as label,count(*) as quantity from " BUILDIDS "_f_de\n"
   "union all select 'file s',count(*) from " BUILDIDS "_f_s\n"
+  "union all select 'file dwo',count(*) from " BUILDIDS "_f_dwo\n"
   "union all select 'archive d/e',count(*) from " BUILDIDS "_r_de\n"
   "union all select 'archive sref',count(*) from " BUILDIDS "_r_sref\n"
   "union all select 'archive sdef',count(*) from " BUILDIDS "_r_sdef\n"
+  "union all select 'archive dwo',count(*) from " BUILDIDS "_r_dwo\n"
   "union all select 'buildids',count(*) from " BUILDIDS "_buildids\n"
+  "union all select 'dwoids',count(*) from " BUILDIDS "_dwoids\n"
   "union all select 'filenames',count(*) from " BUILDIDS "_files\n"
-  "union all select 'fileparts',count(*) from " BUILDIDS "_fileparts\n"  
+  "union all select 'fileparts',count(*) from " BUILDIDS "_fileparts\n"
   "union all select 'files scanned (#)',count(*) from " BUILDIDS "_file_mtime_scanned\n"
   "union all select 'files scanned (mb)',coalesce(sum(size)/1024/1024,0) from " BUILDIDS "_file_mtime_scanned\n"
 #if SQLITE_VERSION_NUMBER >= 3016000
@@ -343,8 +389,27 @@ static const char DEBUGINFOD_SQLITE_DDL[] =
 // data over instead of just dropping it.  But that could incur
 // doubled storage costs.
 //
-// buildids10: split the _files table into _parts
+// buildids11: add DWO/DWP split DWARF support
   "" // <<< we are here
+// buildids10: split the _files table into _parts
+  "DROP VIEW IF EXISTS buildids10_stats;\n"
+  "DROP VIEW IF EXISTS buildids10_query_s;\n"
+  "DROP VIEW IF EXISTS buildids10_query_e2;\n"
+  "DROP VIEW IF EXISTS buildids10_query_d2;\n"
+  "DROP VIEW IF EXISTS buildids10_files_v;\n"
+  "DROP INDEX IF EXISTS buildids10_r_de_idx;\n"
+  "DROP INDEX IF EXISTS buildids10_r_de_idx2;\n"
+  "DROP INDEX IF EXISTS buildids10_f_de_idx;\n"
+  "DROP TABLE IF EXISTS buildids10_r_seekable;\n"
+  "DROP TABLE IF EXISTS buildids10_r_sdef;\n"
+  "DROP TABLE IF EXISTS buildids10_r_sref;\n"
+  "DROP TABLE IF EXISTS buildids10_r_de;\n"
+  "DROP TABLE IF EXISTS buildids10_f_s;\n"
+  "DROP TABLE IF EXISTS buildids10_f_de;\n"
+  "DROP TABLE IF EXISTS buildids10_file_mtime_scanned;\n"
+  "DROP TABLE IF EXISTS buildids10_files;\n"
+  "DROP TABLE IF EXISTS buildids10_fileparts;\n"
+  "DROP TABLE IF EXISTS buildids10_buildids;\n"
 // buildids9: widen the mtime_scanned table
   "DROP VIEW IF EXISTS buildids9_stats;\n"
   "DROP INDEX IF EXISTS buildids9_r_de_idx;\n"
@@ -3444,6 +3509,68 @@ handle_buildid (MHD_Connection* conn,
 }
 
 
+static struct MHD_Response*
+handle_dwoid (MHD_Connection* conn,
+              const string& dwoid /* unsafe */,
+              int *result_fd)
+{
+  if (conn != 0)
+    inc_metric("http_requests_total", "type", "dwoid");
+
+  // validate dwoid: must be exactly 16 lowercase hex chars (64-bit)
+  if ((dwoid.size() != 16) ||
+      (dwoid.find_first_not_of("0123456789abcdef") != string::npos))
+    throw reportable_exception("invalid dwoid");
+
+  if (verbose > 1)
+    obatched(clog) << "searching for dwoid=" << dwoid << endl;
+
+  // If invoked from the scanner threads, use the scanners' read-write
+  // connection.  Otherwise use the web query threads' read-only connection.
+  sqlite3 *thisdb = (conn == 0) ? db : dbq;
+
+  sqlite_ps pp (thisdb, "mhd-query-dwo",
+                "select mtime, sourcetype, source0, source1, id0, id1, is_dwp from " BUILDIDS "_query_dwo where dwoid = ? "
+                "order by mtime desc");
+  pp.reset();
+  pp.bind(1, dwoid);
+
+  // consume all the rows
+  while (1)
+    {
+      int rc = pp.step();
+      if (rc == SQLITE_DONE) break;
+      if (rc != SQLITE_ROW)
+        throw sqlite_exception(rc, "step");
+
+      int64_t b_mtime = sqlite3_column_int64 (pp, 0);
+      string b_stype = string((const char*) sqlite3_column_text (pp, 1) ?: ""); /* by DDL may not be NULL */
+      string b_source0 = string((const char*) sqlite3_column_text (pp, 2) ?: ""); /* may be NULL */
+      string b_source1 = string((const char*) sqlite3_column_text (pp, 3) ?: ""); /* may be NULL */
+      int64_t b_id0 = sqlite3_column_int64 (pp, 4);
+      int64_t b_id1 = sqlite3_column_int64 (pp, 5);
+      // int b_is_dwp = sqlite3_column_int (pp, 6);  // For potential future use
+
+      if (verbose > 1)
+        obatched(clog) << "found dwoid mtime=" << b_mtime << " stype=" << b_stype
+                       << " source0=" << b_source0 << " source1=" << b_source1 << endl;
+
+      // Try accessing the located match - return the whole file (no section extraction)
+      auto r = handle_buildid_match (conn ? false : true,
+                                     b_mtime, b_stype, b_source0, b_source1,
+                                     b_id0, b_id1, "", result_fd);
+      if (r)
+        return r;
+    }
+  pp.reset();
+
+  // TODO: Federation support for dwoid queries would require client library extension
+  // For now, we don't forward dwoid queries to upstream servers
+
+  throw reportable_exception(MHD_HTTP_NOT_FOUND, "dwoid not found");
+}
+
+
 ////////////////////////////////////////////////////////////////////////
 
 static map<string,double> metrics; // arbitrary data for /metrics query
@@ -3979,6 +4106,53 @@ handler_cb (void * /*cls*/,
               // libmicrohttpd will close (fd);
             }
         }
+      else if (slash1 != string::npos && url1 == "/dwoid")
+        {
+          // Similar blocking logic as /buildid
+          add_metric ("thread_busy", "role", "http-dwoid-after-you", 1);
+#ifdef HAVE_PTHREAD_SETNAME_NP
+          (void) pthread_setname_np (pthread_self(), "mhd-dwoid-after-you");
+#endif
+          struct timespec tsay_start, tsay_end;
+          clock_gettime (CLOCK_MONOTONIC, &tsay_start);
+          static unique_set<string> busy_dwoid_urls;
+          unique_set_reserver<string> after_you(busy_dwoid_urls, url_copy);
+          clock_gettime (CLOCK_MONOTONIC, &tsay_end);
+          afteryou = (tsay_end.tv_sec - tsay_start.tv_sec) + (tsay_end.tv_nsec - tsay_start.tv_nsec)/1.e9;
+          add_metric ("thread_busy", "role", "http-dwoid-after-you", -1);
+
+          tmp_inc_metric m ("thread_busy", "role", "http-dwoid");
+#ifdef HAVE_PTHREAD_SETNAME_NP
+          (void) pthread_setname_np (pthread_self(), "mhd-dwoid");
+#endif
+          size_t slash2 = url_copy.find('/', slash1+1);
+          if (slash2 == string::npos)
+            throw reportable_exception("/dwoid/ webapi error, need dwoid");
+
+          string dwoid = url_copy.substr(slash1+1, slash2-slash1-1);
+
+          size_t slash3 = url_copy.find('/', slash2+1);
+
+          // Only "debuginfo" artifact type is supported for dwoid
+          if (slash3 == string::npos)
+            artifacttype = url_copy.substr(slash2+1);
+          else
+            throw reportable_exception("/dwoid/ only supports debuginfo artifact type");
+
+          if (artifacttype != "debuginfo")
+            throw reportable_exception("/dwoid/ only supports debuginfo artifact type");
+
+          // get the resulting fd so we can report its size
+          int fd;
+          r = handle_dwoid (connection, dwoid, &fd);
+          if (r)
+            {
+              struct stat fs;
+              if (fstat(fd, &fs) == 0)
+                http_size = fs.st_size;
+              // libmicrohttpd will close (fd);
+            }
+        }
       else if (url1 == "/metrics")
         {
           tmp_inc_metric m ("thread_busy", "role", "http-metrics");
@@ -4245,10 +4419,75 @@ dwarf_extract_source_paths (Elf *elf, set<string>& debug_sourcefiles)
 }
 
 
+// Extract DWO IDs from split DWARF files (.dwo, .dwp, or .o with split debug)
+static void
+dwarf_extract_dwo_ids (Elf *elf, set<string>& dwo_ids, bool& is_dwp)
+  noexcept
+{
+  is_dwp = false;
+  Dwarf *dbg = dwarf_begin_elf (elf, DWARF_C_READ, NULL);
+  if (dbg == NULL)
+    return;
+
+  // Check if this is a DWP file by looking for .debug_cu_index section
+  Elf_Scn *scn = NULL;
+  size_t shstrndx;
+  if (elf_getshdrstrndx (elf, &shstrndx) == 0)
+    {
+      while ((scn = elf_nextscn (elf, scn)) != NULL)
+        {
+          GElf_Shdr shdr_mem;
+          GElf_Shdr *shdr = gelf_getshdr (scn, &shdr_mem);
+          if (shdr == NULL)
+            continue;
+          const char *section_name = elf_strptr (elf, shstrndx, shdr->sh_name);
+          if (section_name != NULL &&
+              (strcmp (section_name, ".debug_cu_index") == 0 ||
+               strcmp (section_name, ".debug_tu_index") == 0))
+            {
+              is_dwp = true;
+              break;
+            }
+        }
+    }
+
+  // Iterate through all compilation units looking for split units
+  Dwarf_CU *cu = NULL;
+  Dwarf_Half version;
+  uint8_t unit_type;
+  Dwarf_Die cudie;
+
+  while (dwarf_get_units (dbg, cu, &cu, &version, &unit_type, &cudie, NULL) == 0)
+    {
+      // Look for split compile or type units (DW_UT_split_compile = 0x05, DW_UT_split_type = 0x06)
+      if (unit_type == DW_UT_split_compile || unit_type == DW_UT_split_type)
+        {
+          uint64_t unit_id = 0;
+          if (dwarf_cu_info (cu, NULL, NULL, NULL, NULL, &unit_id, NULL, NULL) == 0
+              && unit_id != 0)
+            {
+              // Convert dwo_id to 16-char hex string (lowercase)
+              char dwo_hex[17];
+              snprintf (dwo_hex, sizeof(dwo_hex), "%016" PRIx64, unit_id);
+              dwo_ids.insert (string(dwo_hex));
+
+              if (verbose > 3)
+                obatched(clog) << "found dwo_id=" << dwo_hex
+                               << " unit_type=" << (unsigned)unit_type
+                               << " is_dwp=" << is_dwp << endl;
+            }
+        }
+    }
+
+  dwarf_end (dbg);
+}
+
 
 static void
-elf_classify (int fd, bool &executable_p, bool &debuginfo_p, string &buildid, set<string>& debug_sourcefiles)
+elf_classify (int fd, bool &executable_p, bool &debuginfo_p, string &buildid, set<string>& debug_sourcefiles,
+              set<string>& dwo_ids, bool& is_dwp)
 {
+  is_dwp = false;
   Elf *elf = elf_begin (fd, ELF_C_READ_MMAP_PRIVATE, NULL);
   if (elf == NULL)
     return;
@@ -4272,20 +4511,18 @@ elf_classify (int fd, bool &executable_p, bool &debuginfo_p, string &buildid, se
 
       const void *build_id; // elfutils-owned memory
       ssize_t sz = dwelf_elf_gnu_build_id (elf, & build_id);
-      if (sz <= 0)
-        {
-          // It's not a diagnostic-worthy error for an elf file to lack build-id.
-          // It might just be very old.
-          elf_end (elf);
-          return;
-        }
+      // Note: DWO/DWP files typically don't have build-ids, so we don't return early here.
+      // We'll check for DWO content regardless.
 
       // build_id is a raw byte array; convert to hexadecimal *lowercase*
-      unsigned char* build_id_bytes = (unsigned char*) build_id;
-      for (ssize_t idx=0; idx<sz; idx++)
+      if (sz > 0)
         {
-          buildid += "0123456789abcdef"[build_id_bytes[idx] >> 4];
-          buildid += "0123456789abcdef"[build_id_bytes[idx] & 0xf];
+          unsigned char* build_id_bytes = (unsigned char*) build_id;
+          for (ssize_t idx=0; idx<sz; idx++)
+            {
+              buildid += "0123456789abcdef"[build_id_bytes[idx] >> 4];
+              buildid += "0123456789abcdef"[build_id_bytes[idx] & 0xf];
+            }
         }
 
       // now decide whether it's an executable - namely, any allocatable section has
@@ -4374,6 +4611,10 @@ elf_classify (int fd, bool &executable_p, bool &debuginfo_p, string &buildid, se
       // identify "strip -g" executables (with .symtab left there).
       if (symtab_p && !bits_alloc_p)
         debuginfo_p = true;
+
+      // Check for split DWARF content (.dwo, .dwp, or .o with split debug)
+      // This extracts DWO IDs from files containing DW_UT_split_compile units
+      dwarf_extract_dwo_ids (elf, dwo_ids, is_dwp);
     }
   catch (const reportable_exception& e)
     {
@@ -4447,6 +4688,8 @@ scan_source_file (const string& rps, const stat_t& st,
                   sqlite_ps& ps_upsert_s,
                   sqlite_ps& ps_query,
                   sqlite_ps& ps_scan_done,
+                  sqlite_ps& ps_upsert_dwoids,
+                  sqlite_ps& ps_upsert_dwo,
                   unsigned& fts_cached,
                   unsigned& fts_executable,
                   unsigned& fts_debuginfo,
@@ -4473,12 +4716,14 @@ scan_source_file (const string& rps, const stat_t& st,
   bool executable_p = false, debuginfo_p = false; // E and/or D
   string buildid;
   set<string> sourcefiles;
+  set<string> dwo_ids;
+  bool is_dwp = false;
 
   int fd = open (rps.c_str(), O_RDONLY);
   try
     {
       if (fd >= 0)
-        elf_classify (fd, executable_p, debuginfo_p, buildid, sourcefiles);
+        elf_classify (fd, executable_p, debuginfo_p, buildid, sourcefiles, dwo_ids, is_dwp);
       else
         throw libc_exception(errno, string("open ") + rps);
       add_metric ("scanned_bytes_total","source","file",
@@ -4578,6 +4823,30 @@ scan_source_file (const string& rps, const stat_t& st,
         }
     }
 
+  // Store DWO IDs (for split DWARF files: .dwo, .dwp, or .o with split debug)
+  for (auto&& dwo_hex : dwo_ids)
+    {
+      ps_upsert_dwoids
+        .reset()
+        .bind(1, dwo_hex)
+        .step_ok_done();
+
+      ps_upsert_dwo
+        .reset()
+        .bind(1, dwo_hex)
+        .bind(2, fileid)
+        .bind(3, st.st_mtime)
+        .bind(4, is_dwp ? 1 : 0)
+        .step_ok_done();
+
+      inc_metric("found_dwo_total","source","files");
+
+      if (verbose > 2)
+        obatched(clog) << "recorded dwo_id=" << dwo_hex << " file=" << rps
+                       << " mtime=" << st.st_mtime
+                       << " is_dwp=" << is_dwp << endl;
+    }
+
   ps_scan_done
     .reset()
     .bind(1, fileid)
@@ -4604,6 +4873,7 @@ archive_classify (const string& rps, string& archive_extension, int64_t archivei
                   sqlite_ps& ps_lookup_file,
                   sqlite_ps& ps_upsert_de, sqlite_ps& ps_upsert_sref, sqlite_ps& ps_upsert_sdef,
                   sqlite_ps& ps_upsert_seekable,
+                  sqlite_ps& ps_upsert_dwoids, sqlite_ps& ps_upsert_dwo,
                   time_t mtime,
                   unsigned& fts_executable, unsigned& fts_debuginfo, unsigned& fts_sref, unsigned& fts_sdef,
                   bool& fts_sref_complete_p)
@@ -4709,7 +4979,9 @@ archive_classify (const string& rps, string& archive_extension, int64_t archivei
           bool executable_p = false, debuginfo_p = false;
           string buildid;
           set<string> sourcefiles;
-          elf_classify (fd, executable_p, debuginfo_p, buildid, sourcefiles);
+          set<string> dwo_ids;
+          bool is_dwp = false;
+          elf_classify (fd, executable_p, debuginfo_p, buildid, sourcefiles, dwo_ids, is_dwp);
           // NB: might throw
 
           if (buildid != "") // intern buildid
@@ -4788,7 +5060,33 @@ archive_classify (const string& rps, string& archive_extension, int64_t archivei
                   .bind(5, seekable_mtime)
                   .step_ok_done();
             }
-          else // potential source - sdef record
+
+          // Store DWO IDs (for split DWARF files in archives)
+          for (auto&& dwo_hex : dwo_ids)
+            {
+              ps_upsert_dwoids
+                .reset()
+                .bind(1, dwo_hex)
+                .step_ok_done();
+
+              ps_upsert_dwo
+                .reset()
+                .bind(1, dwo_hex)
+                .bind(2, archiveid)
+                .bind(3, mtime)
+                .bind(4, fileid)
+                .bind(5, is_dwp ? 1 : 0)
+                .step_ok_done();
+
+              inc_metric("found_dwo_total","source","archive");
+
+              if (verbose > 2)
+                obatched(clog) << "recorded dwo_id=" << dwo_hex << " rpm=" << rps
+                               << " file=" << fn << " mtime=" << mtime
+                               << " is_dwp=" << is_dwp << endl;
+            }
+
+          if (! (executable_p || debuginfo_p)) // potential source - sdef record
             {
               fts_sdef ++;
               ps_upsert_sdef
@@ -4846,6 +5144,8 @@ scan_archive_file (const string& rps, const stat_t& st,
                    sqlite_ps& ps_upsert_seekable,
                    sqlite_ps& ps_query,
                    sqlite_ps& ps_scan_done,
+                   sqlite_ps& ps_upsert_dwoids,
+                   sqlite_ps& ps_upsert_dwo,
                    unsigned& fts_cached,
                    unsigned& fts_executable,
                    unsigned& fts_debuginfo,
@@ -4881,7 +5181,8 @@ scan_archive_file (const string& rps, const stat_t& st,
       string archive_extension;
       archive_classify (rps, archive_extension, archiveid,
                         ps_upsert_buildids, ps_upsert_fileparts, ps_upsert_file, ps_lookup_file,
-                        ps_upsert_de, ps_upsert_sref, ps_upsert_sdef, ps_upsert_seekable, // dalt
+                        ps_upsert_de, ps_upsert_sref, ps_upsert_sdef, ps_upsert_seekable,
+                        ps_upsert_dwoids, ps_upsert_dwo,
                         st.st_mtime,
                         my_fts_executable, my_fts_debuginfo, my_fts_sref, my_fts_sdef,
                         my_fts_sref_complete_p);
@@ -4966,6 +5267,13 @@ scan ()
   sqlite_ps ps_f_scan_done (db, "file-scanned",
                           "insert or ignore into " BUILDIDS "_file_mtime_scanned (sourcetype, file, mtime, size)"
                           "values ('F', ?,?,?);");
+  // DWO tables for file scanning
+  sqlite_ps ps_f_upsert_dwoids (db, "file-dwoids-intern", "insert or ignore into " BUILDIDS "_dwoids VALUES (NULL, ?);");
+  sqlite_ps ps_f_upsert_dwo (db, "file-dwo-upsert",
+                          "insert or ignore into " BUILDIDS "_f_dwo "
+                          "(dwoid, file, mtime, is_dwp) "
+                          "values ((select id from " BUILDIDS "_dwoids where hex = ?),"
+                            "        ?,?,?);");
 
   // and now for the _r_ set
   sqlite_ps ps_r_upsert_buildids (db, "rpm-buildid-intern", "insert or ignore into " BUILDIDS "_buildids VALUES (NULL, ?);");
@@ -4996,7 +5304,11 @@ scan ()
   sqlite_ps ps_r_scan_done (db, "rpm-scanned",
                           "insert or ignore into " BUILDIDS "_file_mtime_scanned (sourcetype, file, mtime, size)"
                           "values ('R', ?, ?, ?);");
-  
+  // DWO tables for archive scanning
+  sqlite_ps ps_r_upsert_dwoids (db, "rpm-dwoids-intern", "insert or ignore into " BUILDIDS "_dwoids VALUES (NULL, ?);");
+  sqlite_ps ps_r_upsert_dwo (db, "rpm-dwo-insert",
+                          "insert or ignore into " BUILDIDS "_r_dwo (dwoid, file, mtime, content, is_dwp) values ("
+                          "(select id from " BUILDIDS "_dwoids where hex = ?), ?, ?, ?, ?);");
 
   unsigned fts_cached = 0, fts_executable = 0, fts_debuginfo = 0, fts_sourcefiles = 0;
   unsigned fts_sref = 0, fts_sdef = 0;
@@ -5035,6 +5347,8 @@ scan ()
                                ps_r_upsert_seekable,
                                ps_r_query,
                                ps_r_scan_done,
+                               ps_r_upsert_dwoids,
+                               ps_r_upsert_dwo,
                                fts_cached,
                                fts_executable,
                                fts_debuginfo,
@@ -5051,6 +5365,8 @@ scan ()
                               ps_f_upsert_s,
                               ps_f_query,
                               ps_f_scan_done,
+                              ps_f_upsert_dwoids,
+                              ps_f_upsert_dwo,
                               fts_cached, fts_executable, fts_debuginfo, fts_sourcefiles);
         }
       catch (const reportable_exception& e)
