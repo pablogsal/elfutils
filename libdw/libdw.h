@@ -1124,6 +1124,25 @@ extern int dwarf_cu_dwp_section_info (Dwarf_CU *cu, unsigned int section,
 				      Dwarf_Off *offsetp, Dwarf_Off *sizep);
 
 
+/* Set a callback for locating split DWARF files (DWO/DWP) by dwo_id.
+
+   When libdw needs to find a split DWARF unit and cannot locate it
+   locally, it will call this callback with the 64-bit dwo_id.  The
+   callback should return a file descriptor for the DWO/DWP file on
+   success, or -1 on failure.  libdw will take ownership of the
+   returned file descriptor and close it when done.
+
+   USER_DATA is passed to the callback unchanged.  Pass NULL for both
+   callback and user_data to clear any previously set callback.
+
+   This function is thread-safe and can be called concurrently with
+   split DWARF lookups.  */
+extern void dwarf_set_dwo_lookup (Dwarf *dbg,
+				  int (*callback) (uint64_t dwo_id,
+						   void *user_data),
+				  void *user_data);
+
+
 /* Return error code of last failing function call.  This value is kept
    separately for each thread.  */
 extern int dwarf_errno (void);

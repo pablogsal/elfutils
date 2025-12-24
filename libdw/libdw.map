@@ -390,6 +390,7 @@ ELFUTILS_0.193 {
   global:
     dwarf_language;
     dwarf_language_lower_bound;
+    dwarf_set_dwo_lookup;
 } ELFUTILS_0.192;
 
 /* XXX Experimental libdwfl_stacktrace API. */

@@ -289,6 +289,12 @@ struct Dwarf
 
   /* Registered OOM handler.  */
   Dwarf_OOM oom_handler;
+
+  /* DWO lookup callback.  If set, called when looking for split DWARF
+     files (DWO/DWP) by dwo_id.  Returns a file descriptor on success,
+     or -1 on failure.  */
+  int (*dwo_lookup_cb) (uint64_t dwo_id, void *user_data);
+  void *dwo_lookup_user_data;
 };
 
 
@@ -522,6 +528,7 @@ INTDECL (dwarf_offdie)
 INTDECL (dwarf_peel_type)
 INTDECL (dwarf_ranges)
 INTDECL (dwarf_setalt)
+INTDECL (dwarf_set_dwo_lookup)
 INTDECL (dwarf_siblingof)
 INTDECL (dwarf_srclang)
 INTDECL (dwarf_tag)
