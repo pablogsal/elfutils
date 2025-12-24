@@ -55,6 +55,7 @@ static const char args_doc[] = N_("debuginfo BUILDID\n"
                                   "section BUILDID SECTION-NAME\n"
                                   "section PATH SECTION-NAME\n"
                                   "metadata (glob|file|KEY) (GLOB|FILENAME|VALUE)\n"
+                                  "dwoid DWOID\n"
                                   );
 
 /* Definitions of arguments for argp functions.  */
@@ -264,7 +265,7 @@ main(int argc, char** argv)
           fprintf(stderr, "Require KEY and VALUE for \"metadata\"\n");
           return 1;
         }
-      
+
       rc = debuginfod_find_metadata (client, argv[remaining+1], argv[remaining+2],
                                      &cache_name);
 #ifndef DUMMY_LIBDEBUGINFOD
@@ -290,6 +291,19 @@ main(int argc, char** argv)
             }
         }
 #endif
+    }
+  else if (strcmp(argv[remaining], "dwoid") == 0) /* DWO ID, not buildid! */
+    {
+      /* DWO ID should be a 16-character hex string (64-bit value).
+         Pass it directly as a hex string (dwo_id_len == 0).  */
+      const char *dwoid_str = argv[remaining+1];
+      size_t len = strlen(dwoid_str);
+      if (len == 0 || len > 16)
+        {
+          fprintf(stderr, "DWO ID must be 1-16 hex characters: %s\n", dwoid_str);
+          return 1;
+        }
+      rc = debuginfod_find_dwo(client, (const unsigned char *)dwoid_str, 0, &cache_name);
     }
   else
     {

@@ -25,3 +25,7 @@ ELFUTILS_0.188 {
 ELFUTILS_0.192 {
   debuginfod_find_metadata;
 } ELFUTILS_0.188;
+ELFUTILS_0.193 {
+  debuginfod_find_dwo;
+  debuginfod_find_dwo_by_id;
+} ELFUTILS_0.192;

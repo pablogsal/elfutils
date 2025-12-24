@@ -45,6 +45,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <gelf.h>
 
 #ifdef ENABLE_IMA_VERIFICATION
@@ -73,6 +74,10 @@ int debuginfod_find_section (debuginfod_client *c, const unsigned char *b,
 			      { return -ENOSYS; }
 int debuginfod_find_metadata (debuginfod_client *c,
                               const char *k, const char *v, char **p) { return -ENOSYS; }
+int debuginfod_find_dwo (debuginfod_client *c, const unsigned char *d,
+                         int s, char **p) { return -ENOSYS; }
+int debuginfod_find_dwo_by_id (debuginfod_client *c, uint64_t d,
+                               char **p) { return -ENOSYS; }
 void debuginfod_set_progressfn(debuginfod_client *c,
 			       debuginfod_progressfn_t fn) { }
 void debuginfod_set_verbose_fd(debuginfod_client *c, int fd) { }
@@ -3137,5 +3142,382 @@ debuginfod_set_verbose_fd(debuginfod_client *client, int fd)
 {
   client->verbose_fd = fd;
 }
+
+
+/* Query the urls contained in $DEBUGINFOD_URLS for a DWO/DWP file
+   with the specified DWO ID.  DWO IDs are 64-bit (8 bytes / 16 hex chars).
+
+   If dwo_id_len == 0, the dwo_id is supplied as a lowercase hexadecimal
+   string; otherwise it is a binary blob of given length.
+
+   If successful, return a file descriptor to the target, otherwise
+   return a negative POSIX error code.  If successful, set *path to a
+   strdup'd copy of the name of the same file in the cache.  Caller
+   must free() it later.  */
+int
+debuginfod_find_dwo (debuginfod_client *client,
+                     const unsigned char *dwo_id,
+                     int dwo_id_len,
+                     char **path)
+{
+  /* DWO IDs are 64-bit, so max 8 bytes / 16 hex characters.  */
+  const int max_dwo_id_bytes = 8;
+  char dwo_id_hex[max_dwo_id_bytes * 2 + 1];
+  char *server_urls = NULL;
+  char *urls_envvar = NULL;
+  char *cache_path = NULL;
+  char *target_cache_dir = NULL;
+  char *target_cache_path = NULL;
+  char *target_cache_tmppath = NULL;
+  int fd = -1;
+  int rc = -ENOENT;
+  int r;
+  int vfd = client->verbose_fd;
+  struct handle_data *data = NULL;
+
+  client->progressfn_cancel = false;
+
+  if (vfd >= 0)
+    {
+      dprintf (vfd, "debuginfod_find_dwo ");
+      if (dwo_id_len == 0)
+        dprintf (vfd, "%s", (const char *) dwo_id);
+      else
+        for (int i = 0; i < dwo_id_len; i++)
+          dprintf (vfd, "%02x", dwo_id[i]);
+      dprintf (vfd, "\n");
+    }
+
+  /* Validate and convert dwo_id to hex string.  */
+  if (dwo_id_len > max_dwo_id_bytes)
+    return -EINVAL;
+
+  if (dwo_id_len == 0)
+    {
+      /* Input is already hex string - validate length.  */
+      size_t len = strlen ((const char *) dwo_id);
+      if (len == 0 || len > max_dwo_id_bytes * 2)
+        return -EINVAL;
+      strcpy (dwo_id_hex, (const char *) dwo_id);
+    }
+  else
+    {
+      /* Bytes are in little-endian order (LSB first), so reverse when
+         converting to hex to get the canonical big-endian hex string.  */
+      for (int i = 0; i < dwo_id_len; i++)
+        sprintf (dwo_id_hex + (i * 2), "%02x", dwo_id[dwo_id_len - 1 - i]);
+    }
+
+  /* Is there any server we can query? */
+  urls_envvar = getenv (DEBUGINFOD_URLS_ENV_VAR);
+  if (vfd >= 0)
+    dprintf (vfd, "server urls \"%s\"\n",
+             urls_envvar != NULL ? urls_envvar : "");
+  if (urls_envvar == NULL || urls_envvar[0] == '\0')
+    {
+      rc = -ENOSYS;
+      goto out;
+    }
+
+  /* Clear obsolete data from previous operation.  */
+  free (client->url);
+  client->url = NULL;
+  free (client->winning_headers);
+  client->winning_headers = NULL;
+
+  add_default_headers (client);
+
+  /* Set up cache paths.
+     Cache path: {cache}/dwoid/{dwo_id_hex}/debuginfo  */
+  cache_path = make_cache_path ();
+  if (!cache_path)
+    {
+      rc = -ENOMEM;
+      goto out;
+    }
+  xalloc_str (target_cache_dir, "%s/dwoid/%s", cache_path, dwo_id_hex);
+  xalloc_str (target_cache_path, "%s/debuginfo", target_cache_dir);
+  xalloc_str (target_cache_tmppath, "%s.XXXXXX", target_cache_path);
+
+  /* Check if file is already in cache.  */
+  fd = open (target_cache_path, O_RDONLY);
+  if (fd >= 0)
+    {
+      struct stat st;
+      if (fstat (fd, &st) == 0 && st.st_size > 0)
+        {
+          if (vfd >= 0)
+            dprintf (vfd, "found %s in cache\n", target_cache_path);
+          if (path != NULL)
+            {
+              *path = strdup (target_cache_path);
+              if (*path == NULL)
+                {
+                  close (fd);
+                  rc = -ENOMEM;
+                  goto out;
+                }
+            }
+          rc = fd;
+          goto out;
+        }
+      close (fd);
+      fd = -1;
+    }
+
+  /* Make a copy of the envvar so it can be safely modified.  */
+  server_urls = strdup (urls_envvar);
+  if (server_urls == NULL)
+    {
+      rc = -ENOMEM;
+      goto out;
+    }
+
+  /* Create target directory in cache.  */
+  char *dwo_id_dir = NULL;
+  xalloc_str (dwo_id_dir, "%s/dwoid", cache_path);
+  (void) mkdir (dwo_id_dir, 0700);
+  free (dwo_id_dir);
+  (void) mkdir (target_cache_dir, 0700);
+
+  fd = mkstemp (target_cache_tmppath);
+  if (fd < 0)
+    {
+      rc = -errno;
+      goto out;
+    }
+
+  long timeout = default_timeout;
+  const char *timeout_envvar = getenv (DEBUGINFOD_TIMEOUT_ENV_VAR);
+  if (timeout_envvar != NULL)
+    timeout = atoi (timeout_envvar);
+
+  char **server_url_list = NULL;
+  ima_policy_t *url_ima_policies = NULL;
+  char *server_url;
+  int num_urls = 0;
+  /* Use "dwoid" as the URL subdirectory.  */
+  r = init_server_urls ("dwoid", "debuginfo", server_urls, &server_url_list,
+                        &url_ima_policies, &num_urls, vfd);
+  if (r != 0)
+    {
+      rc = r;
+      goto out1;
+    }
+
+  if (num_urls == 0)
+    {
+      rc = -ENOSYS;
+      goto out1;
+    }
+
+  CURLM *curlm = client->server_mhandle;
+  CURL *target_handle = NULL;
+
+  data = malloc (sizeof (struct handle_data) * num_urls);
+  if (data == NULL)
+    {
+      rc = -ENOMEM;
+      goto out1;
+    }
+
+  /* Initialize handle_data.  */
+  for (int i = 0; i < num_urls; i++)
+    {
+      data[i].handle = NULL;
+      data[i].fd = -1;
+      data[i].errbuf[0] = '\0';
+      data[i].response_data = NULL;
+      data[i].response_data_size = 0;
+    }
+
+  /* Initialize each handle with URL: {server}/dwoid/{dwo_id}/debuginfo  */
+  for (int i = 0; i < num_urls; i++)
+    {
+      if ((server_url = server_url_list[i]) == NULL)
+        break;
+      if (vfd >= 0)
+        dprintf (vfd, "init server %d %s\n", i, server_url);
+
+      data[i].fd = fd;
+      data[i].target_handle = &target_handle;
+      data[i].client = client;
+
+      /* URL format: {base}/dwoid/{dwo_id}/debuginfo
+         server_url already contains {base}/dwoid from init_server_urls.  */
+      snprintf (data[i].url, PATH_MAX, "%s/%s/debuginfo", server_url, dwo_id_hex);
+
+      r = init_handle (client, debuginfod_write_callback, header_callback,
+                       &data[i], i, timeout, vfd);
+      if (r != 0)
+        {
+          rc = r;
+          goto out2;
+        }
+
+      curl_multi_add_handle (curlm, data[i].handle);
+    }
+
+  /* Query servers in parallel.  */
+  if (vfd >= 0)
+    dprintf (vfd, "query %d urls in parallel\n", num_urls);
+
+  long maxtime = 0;
+  const char *maxtime_envvar = getenv (DEBUGINFOD_MAXTIME_ENV_VAR);
+  if (maxtime_envvar != NULL)
+    maxtime = atol (maxtime_envvar);
+
+  long maxsize = 0;
+  const char *maxsize_envvar = getenv (DEBUGINFOD_MAXSIZE_ENV_VAR);
+  if (maxsize_envvar != NULL)
+    maxsize = atol (maxsize_envvar);
+
+  int committed_to;
+  r = perform_queries (curlm, &target_handle, data, client, num_urls,
+                       maxtime, maxsize, true, vfd, &committed_to);
+  if (r != 0)
+    {
+      rc = r;
+      goto out2;
+    }
+
+  /* Check whether a query was successful.  */
+  int num_msg;
+  rc = -ENOENT;
+  CURL *verified_handle = NULL;
+  do
+    {
+      CURLMsg *msg = curl_multi_info_read (curlm, &num_msg);
+      if (msg != NULL && msg->msg == CURLMSG_DONE)
+        {
+          if (msg->data.result != CURLE_OK)
+            {
+              long resp_code;
+              CURLcode ok0 = curl_easy_getinfo (msg->easy_handle,
+                                                CURLINFO_RESPONSE_CODE,
+                                                &resp_code);
+              switch (msg->data.result)
+                {
+                case CURLE_COULDNT_RESOLVE_HOST: rc = -EHOSTUNREACH; break;
+                case CURLE_URL_MALFORMAT: rc = -EINVAL; break;
+                case CURLE_COULDNT_CONNECT: rc = -ECONNREFUSED; break;
+                case CURLE_PEER_FAILED_VERIFICATION: rc = -ECONNREFUSED; break;
+                case CURLE_REMOTE_ACCESS_DENIED: rc = -EACCES; break;
+                case CURLE_WRITE_ERROR: rc = -EIO; break;
+                case CURLE_OUT_OF_MEMORY: rc = -ENOMEM; break;
+                case CURLE_TOO_MANY_REDIRECTS: rc = -EMLINK; break;
+                case CURLE_SEND_ERROR: rc = -ECONNRESET; break;
+                case CURLE_RECV_ERROR: rc = -ECONNRESET; break;
+                case CURLE_ABORTED_BY_CALLBACK: rc = -ENOENT; break;
+                case CURLE_HTTP_RETURNED_ERROR:
+                  if (ok0 == CURLE_OK)
+                    {
+                      if (resp_code == 503 || resp_code == 504)
+                        rc = -EBUSY;
+                      else if (resp_code >= 400 && resp_code < 500)
+                        rc = -ENOENT;
+                      else
+                        rc = -ECONNRESET;
+                    }
+                  break;
+                default: rc = -ENOENT; break;
+                }
+            }
+          else if (msg->easy_handle == target_handle)
+            {
+              /* Success!  */
+              verified_handle = msg->easy_handle;
+            }
+        }
+    }
+  while (num_msg > 0);
+
+  /* Remove and cleanup handles.  */
+  for (int i = 0; i < num_urls; i++)
+    {
+      if (data[i].handle != NULL)
+        {
+          curl_multi_remove_handle (curlm, data[i].handle);
+          curl_easy_cleanup (data[i].handle);
+        }
+      free (data[i].response_data);
+    }
+
+  if (verified_handle == NULL)
+    goto out2;
+
+  /* Success - finalize cached file.  */
+  (void) fchmod (fd, 0400);
+  close (fd);
+  fd = -1;
+
+  if (rename (target_cache_tmppath, target_cache_path) != 0)
+    {
+      rc = -errno;
+      goto out2;
+    }
+
+  fd = open (target_cache_path, O_RDONLY);
+  if (fd < 0)
+    {
+      rc = -errno;
+      goto out2;
+    }
+
+  if (path != NULL)
+    {
+      *path = strdup (target_cache_path);
+      if (*path == NULL)
+        {
+          close (fd);
+          fd = -1;
+          rc = -ENOMEM;
+          goto out2;
+        }
+    }
+
+  rc = fd;
+  fd = -1;  /* Don't close on cleanup.  */
+
+ out2:
+  free (data);
+ out1:
+  for (int i = 0; i < num_urls; i++)
+    free (server_url_list[i]);
+  free (server_url_list);
+  free (url_ima_policies);
+
+  if (fd >= 0)
+    {
+      close (fd);
+      (void) unlink (target_cache_tmppath);
+    }
+ out:
+  free (server_urls);
+  curl_slist_free_all (client->headers);
+  client->headers = NULL;
+  client->user_agent_set_p = 0;
+
+  free (target_cache_dir);
+  free (target_cache_path);
+  free (target_cache_tmppath);
+  free (cache_path);
+
+  return rc;
+}
+
+
+/* Convenience wrapper that takes a 64-bit DWO ID directly.  */
+int
+debuginfod_find_dwo_by_id (debuginfod_client *client,
+                           uint64_t dwo_id,
+                           char **path)
+{
+  unsigned char dwo_id_bytes[8];
+  for (int i = 0; i < 8; i++)
+    dwo_id_bytes[i] = (dwo_id >> (i * 8)) & 0xff;
+  return debuginfod_find_dwo (client, dwo_id_bytes, 8, path);
+}
+
 
 #endif /* DUMMY_LIBDEBUGINFOD */
